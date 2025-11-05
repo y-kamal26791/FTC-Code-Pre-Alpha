@@ -35,7 +35,7 @@ public class PIDTestAuto extends LinearOpMode {
         frontRightMotor.setDirection(DcMotor.Direction.FORWARD);
 		frontLeftMotor.setDirection(DcMotor.Direction.FORWARD);
         backRightMotor.setDirection(DcMotor.Direction.FORWARD);
-		backLeftMotor.setDirection(DcMotor.Direction.FORWARD;
+		backLeftMotor.setDirection(DcMotor.Direction.FORWARD);
 
         waitForStart();
 
@@ -190,3 +190,4 @@ public class PIDTestAuto extends LinearOpMode {
         backRightMotor.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
     }
 }
+
