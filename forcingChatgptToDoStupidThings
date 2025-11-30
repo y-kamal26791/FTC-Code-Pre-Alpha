@@ -1,0 +1,392 @@
+package org.firstinspires.ftc.teamcode.opmodes.teleops;
+
+import com.qualcomm.hardware.rev.RevHubOrientationOnRobot;
+import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
+import com.qualcomm.robotcore.eventloop.opmode.TeleOp;
+import com.qualcomm.robotcore.hardware.DcMotor;
+import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.hardware.DcMotorSimple;
+import com.qualcomm.robotcore.hardware.IMU;
+import com.qualcomm.robotcore.hardware.Servo;
+import com.qualcomm.robotcore.hardware.PIDFCoefficients;
+import com.qualcomm.robotcore.util.ElapsedTime;
+
+import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
+
+@TeleOp
+public class ForcingChatgptToDoStupidThings extends LinearOpMode {
+
+    private double driveMultiplier = 1.0;
+    private final double precisionMultiplier = 0.45;
+    private final double turboMultiplier = 1.25;
+    private final double strafeScale = 0.9;
+    private final double slewMaxChangeDrive = 0.08;
+    private final double slewMaxChangeRotate = 0.07;
+    private double headingKP = 0.02;
+    private final double headingToleranceDeg = 2.0;
+    private final double shooterPresetClose = 1200;
+    private final double shooterPresetMid = 1500;
+    private final double shooterPresetFar = 1750;
+    private double shooterTarget = 0;
+    private final PIDFCoefficients shooterPIDF = new PIDFCoefficients(8.0, 0.01, 6.0, 12.0);
+    private final double intakeJamVelocityThreshold = 10.0;
+    private final double intakeJamDetectWindow = 0.25;
+    private final double tipAngleThreshold = 20.0;
+    private final double tipPowerScale = 0.55;
+    private static final long BUTTON_DEBOUNCE_MS = 180;
+
+    @Override
+    public void runOpMode() throws InterruptedException {
+        // Hardware map
+        DcMotor frontRightMotor = hardwareMap.get(DcMotor.class, "frontRightMotor");
+        DcMotor frontLeftMotor  = hardwareMap.get(DcMotor.class, "frontLeftMotor");
+        DcMotor backRightMotor  = hardwareMap.get(DcMotor.class, "backRightMotor");
+        DcMotor backLeftMotor   = hardwareMap.get(DcMotor.class, "backLeftMotor");
+
+        DcMotorEx intakeEx   = null;
+        DcMotorEx shooterEx  = null;
+      
+        try { intakeEx  = hardwareMap.get(DcMotorEx.class, "intake"); }   catch (Exception ignored) {}
+        try { shooterEx = hardwareMap.get(DcMotorEx.class, "shooter"); }  catch (Exception ignored) {}
+
+        DcMotor  intake     = hardwareMap.get(DcMotor.class, "intake");
+        DcMotor  shooterRaw = hardwareMap.get(DcMotor.class, "shooter");
+
+        Servo pushythingy = hardwareMap.get(Servo.class, "pushythingy");
+
+        IMU imu = hardwareMap.get(IMU.class, "imu");
+        IMU.Parameters params = new IMU.Parameters(
+            new RevHubOrientationOnRobot(
+                RevHubOrientationOnRobot.LogoFacingDirection.LEFT,
+                RevHubOrientationOnRobot.UsbFacingDirection.UP
+            )
+        );
+        imu.initialize(params);
+        imu.resetYaw();
+
+        // Motor direction & zero power behaviour
+        frontLeft.setDirection(DcMotorSimple.Direction.FORWARD);
+        backLeft.setDirection(DcMotorSimple.Direction.FORWARD);
+        frontRight.setDirection(DcMotorSimple.Direction.FORWARD);
+        backRight.setDirection(DcMotorSimple.Direction.FORWARD);
+
+        intake.setDirection(DcMotorSimple.Direction.REVERSE);
+        if (shooterEx != null) shooterEx.setDirection(DcMotorSimple.Direction.FORWARD);
+        else shooterRaw.setDirection(DcMotorSimple.Direction.FORWARD);
+
+        frontLeft.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        frontRight.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        backLeft.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        backRight.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+
+      
+        if (shooterEx != null) {
+            shooterEx.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.FLOAT);
+            try {
+                shooterEx.setPIDFCoefficients(DcMotor.RunMode.RUN_USING_ENCODER, shooterPIDF);
+            } catch (Exception ignored) { }
+        }
+
+        // Input‑state helpers (inline, no external classes)
+        class Toggle {
+            boolean last = false;
+            boolean state = false;
+            long lastChange = 0;
+            boolean getToggle(boolean current) {
+                long now = System.currentTimeMillis();
+                if (current && !last && (now - lastChange) > BUTTON_DEBOUNCE_MS) {
+                    state = !state;
+                    lastChange = now;
+                }
+                last = current;
+                return state;
+            }
+            boolean getPressed(boolean current) {
+                long now = System.currentTimeMillis();
+                boolean pressed = current && !last && (now - lastChange) > BUTTON_DEBOUNCE_MS;
+                if (pressed) lastChange = now;
+                last = current;
+                return pressed;
+            }
+        }
+
+        Toggle toggleIntake   = new Toggle();
+        Toggle toggleShooter  = new Toggle();
+        Toggle headingLockBtn = new Toggle();
+        Toggle snapLeftBtn    = new Toggle();
+        Toggle snapRightBtn   = new Toggle();
+
+        boolean headingLockActive = false;
+        double headingLockTarget  = 0.0;
+
+        double lastFL = 0, lastFR = 0, lastBL = 0, lastBR = 0, lastRx = 0;
+
+        ElapsedTime jamTimer      = new ElapsedTime();
+        double lastIntakePos      = intake.getCurrentPosition();
+
+        boolean shooterSeqActive  = false;
+        ElapsedTime shooterSeqT   = new ElapsedTime();
+
+        double idleResetStart     = -1.0;
+
+        waitForStart();
+        runtime.reset();
+
+        while (opModeIsActive()) {
+            // Read inputs
+            double rawY  = -gamepad1.left_stick_y;
+            double rawX  =  gamepad1.left_stick_x * strafeScale;
+            double rawRx =  gamepad1.right_stick_x;
+
+            boolean precisionMode = gamepad1.left_bumper;
+            boolean turboMode     = gamepad1.right_bumper;
+
+            boolean intakeToggle   = toggleIntake.getToggle(gamepad2.a);
+            boolean shooterToggle  = toggleShooter.getToggle(gamepad2.y);
+
+            if (headingLockBtn.getPressed(gamepad1.x)) {
+                headingLockActive = !headingLockActive;
+                if (headingLockActive) {
+                    headingLockTarget = Math.toDegrees(
+                        imu.getRobotYawPitchRollAngles().getYaw(AngleUnit.RADIANS)
+                    );
+                }
+            }
+
+          
+            if (snapLeftBtn.getPressed(gamepad1.dpad_left)) {
+                headingLockActive = true;
+                headingLockTarget = normalizeAngleDegrees(
+                    Math.toDegrees(
+                        imu.getRobotYawPitchRollAngles().getYaw(AngleUnit.RADIANS)
+                    ) - 90.0
+                );
+            }
+          
+            if (snapRightBtn.getPressed(gamepad1.dpad_right)) {
+                headingLockActive = true;
+                headingLockTarget = normalizeAngleDegrees(
+                    Math.toDegrees(
+                        imu.getRobotYawPitchRollAngles().getYaw(AngleUnit.RADIANS)
+                    ) + 90.0
+                );
+            }
+            if (gamepad1.dpad_up) {
+                headingLockActive = true;
+                headingLockTarget = 0.0;
+            }
+
+            if (gamepad2.dpad_up)   shooterTarget += 25;
+            if (gamepad2.dpad_down) shooterTarget -= 25;
+            if (gamepad2.dpad_left) headingKP = Math.max(0.0, headingKP - 0.002);
+            if (gamepad2.dpad_right)headingKP += 0.002;
+
+            if (gamepad2.x) shooterTarget = shooterPresetClose;
+            if (gamepad2.b) shooterTarget = shooterPresetMid;
+            if (gamepad2.a) shooterTarget = shooterPresetFar;
+
+            if (gamepad1.options) {
+                imu.resetYaw();
+            }
+
+            driveMultiplier = 1.0;
+            if (precisionMode) driveMultiplier *= precisionMultiplier;
+            if (turboMode)     driveMultiplier *= turboMultiplier;
+
+            double botHeading = imu.getRobotYawPitchRollAngles().getYaw(AngleUnit.RADIANS);
+            double fieldX = rawX * Math.cos(-botHeading) - rawY * Math.sin(-botHeading);
+            double fieldY = rawX * Math.sin(-botHeading) + rawY * Math.cos(-botHeading);
+
+            double rx = smooth(rawRx, lastRx, slewMaxChangeRotate);
+            lastRx = rx;
+
+            if (headingLockActive) {
+                double currentYawDeg = Math.toDegrees(botHeading);
+                double err = smallestAngleDifference(currentYawDeg, headingLockTarget);
+                if (Math.abs(err) < headingToleranceDeg) {
+                    rx = 0;
+                } else {
+                    rx += err * headingKP;
+                }
+            }
+
+            double denom = Math.max(Math.abs(fieldY) + Math.abs(fieldX) + Math.abs(rx), 1.0);
+            double fl = (fieldY + fieldX + rx) / denom;
+            double bl = (fieldY - fieldX + rx) / denom;
+            double fr = (fieldY - fieldX - rx) / denom;
+            double br = (fieldY + fieldX - rx) / denom;
+
+            fl *= driveMultiplier;
+            bl *= driveMultiplier;
+            fr *= driveMultiplier;
+            br *= driveMultiplier;
+
+            double pitch = imu.getRobotPitchRollAngles().getPitch(AngleUnit.DEGREES);
+            double roll  = imu.getRobotPitchRollAngles().getRoll(AngleUnit.DEGREES);
+            if (Math.abs(pitch) > tipAngleThreshold || Math.abs(roll) > tipAngleThreshold) {
+                fl *= tipPowerScale;
+                fr *= tipPowerScale;
+                bl *= tipPowerScale;
+                br *= tipPowerScale;
+            }
+
+            fl = smooth(fl,  lastFL, slewMaxChangeDrive);
+            fr = smooth(fr,  lastFR, slewMaxChangeDrive);
+            bl = smooth(bl,  lastBL, slewMaxChangeDrive);
+            br = smooth(br,  lastBR, slewMaxChangeDrive);
+
+            lastFL = fl; lastFR = fr; lastBL = bl; lastBR = br;
+
+            frontLeft.setPower(fl);
+            frontRight.setPower(fr);
+            backLeft.setPower(bl);
+            backRight.setPower(br);
+
+            // Intake control & jam detection
+            boolean intakeRunning = false;
+            if (gamepad2.right_trigger > 0.5 || intakeToggle) {
+                intakeRunning = true;
+                setIntake(intakeEx, intake, 1.0);
+            } else if (gamepad2.left_trigger > 0.5) {
+                intakeRunning = true;
+                setIntake(intakeEx, intake, -1.0);
+            } else {
+                setIntake(intakeEx, intake, 0.0);
+            }
+
+            boolean jam = false;
+            if (intakeEx != null) {
+                double vel = intakeEx.getVelocity();
+                if (intakeRunning && Math.abs(vel) < intakeJamVelocityThreshold) {
+                    if (jamTimer.seconds() > intakeJamDetectWindow) {
+                        jam = true;
+                        jamTimer.reset();
+                    }
+                } else {
+                    jamTimer.reset();
+                }
+            } else {
+                double pos = intake.getCurrentPosition();
+                double delta = Math.abs(pos - lastIntakePos);
+                if (intakeRunning && delta < 5 && jamTimer.seconds() > intakeJamDetectWindow) {
+                    jam = true;
+                    jamTimer.reset();
+                }
+                lastIntakePos = pos;
+                if (!intakeRunning) jamTimer.reset();
+            }
+
+            if (jam) {
+                setIntake(intakeEx, intake, -1.0);
+                sleep(150);
+                setIntake(intakeEx, intake, 0.0);
+                try { gamepad1.rumble(200); } catch (Exception ignored) {}
+            }
+
+            // Shooter control
+            if (shooterToggle) {
+                double target = shooterTarget > 0 ? shooterTarget : shooterPresetMid;
+                if (shooterEx != null) {
+                    shooterEx.setVelocity(target);
+                    double vel = shooterEx.getVelocity();
+                    if (Math.abs(vel - target) < 30) {
+                        try { gamepad1.rumble(80); } catch (Exception ignored) {}
+                    }
+                } else {
+                    shooterRaw.setPower(0.85);
+                }
+            } else {
+                if (shooterEx != null) shooterEx.setPower(0.0);
+                else shooterRaw.setPower(0.0);
+            }
+
+            if (gamepad2.right_bumper && !shooterSeqActive) {
+                shooterSeqActive = true;
+                shooterSeqT.reset();
+                if (shooterEx != null) {
+                    shooterEx.setVelocity(shooterTarget > 0 ? shooterTarget : shooterPresetMid);
+                } else {
+                    shooterRaw.setPower(0.85);
+                }
+            }
+
+            if (shooterSeqActive) {
+                if (shooterSeqT.seconds() > 1.2) setIntake(intakeEx, intake, 1.0);
+                if (shooterSeqT.seconds() > 2.6) pushythingy.setPosition(0.0);
+                if (shooterSeqT.seconds() > 3.4) {
+                    setIntake(intakeEx, intake, 0.0);
+                    if (shooterEx != null) shooterEx.setPower(0.0);
+                    else shooterRaw.setPower(0.0);
+                    shooterSeqActive = false;
+                }
+            }
+
+            if (gamepad2.left_bumper) {
+                if (shooterEx != null) shooterEx.setPower(0.0);
+                else shooterRaw.setPower(0.0);
+                shooterSeqActive = false;
+            }
+
+            telemetry.addData("FL", String.format("%.2f", fl));
+            telemetry.addData("FR", String.format("%.2f", fr));
+            telemetry.addData("BL", String.format("%.2f", bl));
+            telemetry.addData("BR", String.format("%.2f", br));
+          
+            telemetry.addData("Heading", Math.toDegrees(botHeading));
+            telemetry.addData("Pitch", pitch);
+            telemetry.addData("Roll", roll);
+      
+            if (shooterEx != null) telemetry.addData("ShooterVel", shooterEx.getVelocity());
+            else telemetry.addData("ShooterPwr", shooterRaw.getPower());
+            if (intakeEx  != null) telemetry.addData("IntakeVel",  intakeEx.getVelocity());
+            else telemetry.addData("IntakePos", intake.getCurrentPosition());
+            telemetry.addData("Jam", jam);
+            telemetry.addData("DriveMode", precisionMode ? "PREC" : (turboMode ? "TURBO" : "NORM"));
+            telemetry.update();
+
+            boolean idle = Math.abs(rawX) < 0.02 && Math.abs(rawY) < 0.02 && Math.abs(rawRx) < 0.02;
+            if (idle) {
+                if (idleResetStart < 0) idleResetStart = runtime.seconds();
+                else if (runtime.seconds() - idleResetStart > 0.08) {
+                    lastFL = lastFR = lastBL = lastBR = lastRx = 0.0;
+                }
+            } else {
+                idleResetStart = -1.0;
+            }
+
+            idle();
+        }
+    }
+
+    private double smooth(double target, double current, double maxChange) {
+        double delta = target - current;
+        if (Math.abs(delta) > maxChange) {
+            delta = Math.signum(delta) * maxChange;
+        }
+        return current + delta;
+    }
+
+    private double normalizeAngleDegrees(double angle) {
+        double a = angle % 360.0;
+        if (a < -180.0) a += 360.0;
+        if (a > 180.0)  a -= 360.0;
+        return a;
+    }
+
+    private double smallestAngleDifference(double fromDeg, double toDeg) {
+        double diff = toDeg - fromDeg;
+        while (diff < -180.0) diff += 360.0;
+        while (diff >  180.0) diff -= 360.0;
+        return diff;
+    }
+
+    private void setIntake(DcMotorEx ex, DcMotor raw, double p) {
+        if (ex != null) {
+            try { ex.setPower(p); }
+            catch (Exception ignored) {}
+        } else {
+            try { raw.setPower(p); }
+            catch (Exception ignored) {}
+        }
+    }
+}
